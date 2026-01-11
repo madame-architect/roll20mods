@@ -2,6 +2,7 @@
 
 This was vibe coded with ChatGPT.
 It could probably be better but I don't really want to dedicate a lot of time to this.
+It works as of today. If it breaks, I may or may not fix it.
 Feel free to PR.
 
 # Roll20 Roll Tables: Import + Pretty Output (PowerCards)
