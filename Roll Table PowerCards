@@ -1,0 +1,200 @@
+/**
+ * RollTableToPowerCard
+ * Command: !rtcard --table|Ammunition [--whisper|gm]
+ *
+ * Rolls a weighted result from a Roll20 Rollable Table and prints a PowerCard with emoji by rarity.
+ * Strips Markdown markers like ** from display.
+ *
+ * Requires: PowerCards (you already have it).
+ */
+
+var RollTableToPowerCard = RollTableToPowerCard || (function () {
+  'use strict';
+
+  var SCRIPT = 'RollTableToPowerCard';
+  var COMMAND = '!rtcard';
+
+  var RARITY_ORDER = ['Legendary', 'Very Rare', 'Rare', 'Uncommon', 'Common'];
+  var RARITY_EMOJI = {
+    'Common': '⚪',
+    'Uncommon': '🟢',
+    'Rare': '🔵',
+    'Very Rare': '🟣',
+    'Legendary': '🟠'
+  };
+
+  function trim(s) { return String(s || '').replace(/^\s+|\s+$/g, ''); }
+
+  function parseArgs(content) {
+    // !rtcard --key|value --flag
+    var args = {};
+    var parts = String(content || '').split(/\s+--/);
+    for (var i = 1; i < parts.length; i++) {
+      var part = parts[i];
+      if (!part) continue;
+      var pipe = part.indexOf('|');
+      if (pipe === -1) args[part.trim().toLowerCase()] = true;
+      else args[part.slice(0, pipe).trim().toLowerCase()] = part.slice(pipe + 1).trim();
+    }
+    return args;
+  }
+
+  function findRollableTableByName(name) {
+    var target = String(name || '').toLowerCase();
+    var all = findObjs({ _type: 'rollabletable' }) || [];
+    for (var i = 0; i < all.length; i++) {
+      if (String(all[i].get('name') || '').toLowerCase() === target) return all[i];
+    }
+    return null;
+  }
+
+  function getTableItems(tableId) {
+    // Roll20 has been inconsistent across scripts; try both keys.
+    var a = findObjs({ _type: 'tableitem', _rollabletableid: tableId }) || [];
+    if (a.length) return a;
+    return findObjs({ _type: 'tableitem', rollabletableid: tableId }) || [];
+  }
+
+  function cleanText(s) {
+    var out = String(s || '');
+    // Strip markdown markers and normalize some punctuation
+    out = out.replace(/\*\*/g, '').replace(/\*/g, '').replace(/`/g, '');
+    out = out.replace(/[\u2013\u2014]/g, '-'); // en dash/em dash -> hyphen
+    out = out.replace(/\s+/g, ' ');
+    return trim(out);
+  }
+
+  function pickWeighted(items) {
+    var total = 0;
+    for (var i = 0; i < items.length; i++) {
+      var w = parseInt(items[i].get('weight'), 10);
+      if (isNaN(w) || w <= 0) w = 1;
+      total += w;
+    }
+    if (total <= 0) return null;
+
+    var roll = randomInteger(total);
+    var running = 0;
+    for (var j = 0; j < items.length; j++) {
+      var w2 = parseInt(items[j].get('weight'), 10);
+      if (isNaN(w2) || w2 <= 0) w2 = 1;
+      running += w2;
+      if (roll <= running) return items[j];
+    }
+    return items[items.length - 1];
+  }
+
+  function extractRarity(name, desc) {
+    var combined = (name + ' ' + desc).toLowerCase();
+
+    for (var i = 0; i < RARITY_ORDER.length; i++) {
+      var r = RARITY_ORDER[i];
+      if (combined.indexOf(r.toLowerCase()) !== -1) return r;
+    }
+    return '';
+  }
+
+  function splitNameDesc(raw) {
+    // Common patterns you might have:
+    // "Name - Uncommon. Effect..."
+    // "Name (Uncommon): Effect..."
+    // "Name - Effect..." (rarity embedded in effect)
+    var s = cleanText(raw);
+
+    var m1 = s.match(/^(.*?)\s*\((Common|Uncommon|Rare|Very Rare|Legendary)\)\s*:\s*(.*)$/i);
+    if (m1) return { name: trim(m1[1]), rarity: m1[2], effect: trim(m1[3]) };
+
+    var parts = s.split(' - ');
+    if (parts.length >= 2) {
+      var n = trim(parts.shift());
+      var rest = trim(parts.join(' - '));
+
+      // If rest starts with "Uncommon." etc, peel it off
+      var m2 = rest.match(/^(Common|Uncommon|Rare|Very Rare|Legendary)\.?\s*(.*)$/i);
+      if (m2) return { name: n, rarity: m2[1], effect: trim(m2[2]) };
+
+      return { name: n, rarity: '', effect: rest };
+    }
+
+    return { name: s, rarity: '', effect: '' };
+  }
+
+  function escForPowerCards(s) {
+    // PowerCards uses | as delimiter; escape it
+    return String(s || '').replace(/\|/g, '&#124;');
+  }
+
+  function buildPowerCard(payload) {
+    var title = payload.title || 'Ammunition';
+    var pc = '!power';
+
+    if (payload.whisper) pc += ' --whisper|' + payload.whisper;
+
+    pc += ' --name|' + escForPowerCards('🏹 ' + title);
+
+    if (payload.rarity) {
+      var e = RARITY_EMOJI[payload.rarity] || '🎲';
+      pc += ' --Rarity|' + escForPowerCards(e + ' ' + payload.rarity);
+    }
+
+    pc += ' --Ammo|' + escForPowerCards(payload.name || 'Unknown');
+
+    if (payload.effect) pc += ' --Effect|' + escForPowerCards(payload.effect);
+
+    return pc;
+  }
+
+  function handleChat(msg) {
+    if (msg.type !== 'api') return;
+    if (String(msg.content || '').indexOf(COMMAND) !== 0) return;
+
+    var args = parseArgs(msg.content);
+    var tableName = args.table || args.t || 'Ammunition';
+    var whisper = args.whisper || args.w || ''; // use "gm" to whisper to GM
+    var title = args.title || tableName;
+
+    var table = findRollableTableByName(tableName);
+    if (!table) {
+      sendChat(SCRIPT, '/w gm ' + SCRIPT + ': Table not found: ' + tableName);
+      return;
+    }
+
+    var items = getTableItems(table.id);
+    if (!items.length) {
+      sendChat(SCRIPT, '/w gm ' + SCRIPT + ': Table has no items: ' + tableName);
+      return;
+    }
+
+    var pick = pickWeighted(items);
+    if (!pick) {
+      sendChat(SCRIPT, '/w gm ' + SCRIPT + ': Could not roll from table: ' + tableName);
+      return;
+    }
+
+    var raw = String(pick.get('name') || '');
+    var parsed = splitNameDesc(raw);
+    var rarity = parsed.rarity || extractRarity(parsed.name, parsed.effect);
+
+    var pc = buildPowerCard({
+      title: title,
+      whisper: whisper,
+      name: parsed.name,
+      rarity: rarity,
+      effect: parsed.effect
+    });
+
+    // Let PowerCards render it
+    sendChat(SCRIPT, pc);
+  }
+
+  function register() {
+    on('chat:message', handleChat);
+    log(SCRIPT + ' ready. Use: ' + COMMAND + ' --table|Ammunition');
+  }
+
+  return { register: register };
+}());
+
+on('ready', function () {
+  RollTableToPowerCard.register();
+});
