@@ -1,0 +1,456 @@
+/**
+ * MDTableImporter v1.1.0
+ * Command: !mdtbl
+ *
+ * Imports the first (or Nth) HTML table from a Handout (Notes or GM Notes) into a Rollable Table.
+ * Also supports pipe-style Markdown tables if no HTML table is found.
+ *
+ * Expected columns: Name/Ammunition | Weight | Description
+ *
+ * Usage:
+ *   !mdtbl --handout|Ammunition Import --table|Ammunition --mode|replace --showplayers|false
+ *
+ * Options:
+ *   --handout|<Handout Name>    (required)
+ *   --table|<Rollable Table>    (optional; default = handout name)
+ *   --mode|replace|append       (default replace)
+ *   --showplayers|true|false    (optional; applied when provided)
+ *   --field|notes|gmnotes       (default notes)
+ *   --index|1                   (which table in handout; default 1)
+ *   --nameonly|true|false       (default false; if true, item = Name only)
+ */
+
+var MDTableImporter = MDTableImporter || (function () {
+  'use strict';
+
+  var SCRIPT = 'MDTableImporter';
+  var COMMAND = '!mdtbl';
+  var VERSION = '1.1.0';
+
+  function isGM(playerid) {
+    return (typeof playerIsGM === 'function') && playerIsGM(playerid);
+  }
+
+  function safePlayerName(playerid) {
+    var p = getObj('player', playerid);
+    var n = p ? (p.get('_displayname') || 'GM') : 'GM';
+    return String(n).replace(/"/g, '\'');
+  }
+
+  function whisper(playerid, msg) {
+    sendChat(SCRIPT, '/w "' + safePlayerName(playerid) + '" ' + msg);
+  }
+
+  function trim(s) {
+    return String(s || '').replace(/^\s+|\s+$/g, '');
+  }
+
+  function toBool(val, def) {
+    if (val === undefined || val === null || val === '') return def;
+    var s = String(val).trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].indexOf(s) !== -1) return true;
+    if (['false', '0', 'no', 'off'].indexOf(s) !== -1) return false;
+    return def;
+  }
+
+  function parseArgs(content) {
+    var args = {};
+    var parts = String(content || '').split(/\s+--/);
+    for (var i = 1; i < parts.length; i++) {
+      var part = parts[i];
+      if (!part) continue;
+      var pipe = part.indexOf('|');
+      if (pipe === -1) {
+        args[part.trim().toLowerCase()] = true;
+      } else {
+        var k = part.slice(0, pipe).trim().toLowerCase();
+        var v = part.slice(pipe + 1).trim();
+        args[k] = v;
+      }
+    }
+    return args;
+  }
+
+  function decodeEntities(s) {
+    var out = String(s || '');
+    out = out.replace(/&#x([0-9a-fA-F]+);/g, function (_, h) {
+      return String.fromCharCode(parseInt(h, 16));
+    });
+    out = out.replace(/&#(\d+);/g, function (_, n) {
+      return String.fromCharCode(parseInt(n, 10));
+    });
+    out = out
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, '\'');
+    return out;
+  }
+
+  function cellHtmlToMarkdown(html) {
+    var s = String(html || '');
+
+    // Line breaks
+    s = s.replace(/<br\s*\/?>/gi, '\n');
+    s = s.replace(/<\/p>/gi, '\n');
+    s = s.replace(/<\/div>/gi, '\n');
+
+    // Preserve simple formatting
+    s = s.replace(/<\/?(strong|b)\b[^>]*>/gi, '**');
+    s = s.replace(/<\/?(em|i)\b[^>]*>/gi, '*');
+    s = s.replace(/<\/?code\b[^>]*>/gi, '`');
+
+    // Strip remaining tags
+    s = s.replace(/<[^>]*>/g, '');
+
+    // Decode entities
+    s = decodeEntities(s);
+
+    // Normalize whitespace inside cell
+    s = s.replace(/\s+/g, ' ').replace(/\n+/g, ' ');
+    return trim(s);
+  }
+
+  function findHandoutByName(name) {
+    var target = String(name || '').toLowerCase();
+    var all = findObjs({ _type: 'handout' }) || [];
+    for (var i = 0; i < all.length; i++) {
+      var n = String(all[i].get('name') || '').toLowerCase();
+      if (n === target) return all[i];
+    }
+    return null;
+  }
+
+  function findRollableTableByName(name) {
+    var target = String(name || '').toLowerCase();
+    var all = findObjs({ _type: 'rollabletable' }) || [];
+    for (var i = 0; i < all.length; i++) {
+      var n = String(all[i].get('name') || '').toLowerCase();
+      if (n === target) return all[i];
+    }
+    return null;
+  }
+
+  function getTableItems(tableId) {
+    return findObjs({ _type: 'tableitem', _rollabletableid: tableId }) || [];
+  }
+
+  function isDividerRow(cells) {
+    // Markdown divider row like: --- | ---: | :---
+    for (var i = 0; i < cells.length; i++) {
+      var c = trim(cells[i]);
+      if (!c) continue;
+      if (!/^:?-{3,}:?$/.test(c) && !/^-{3,}$/.test(c)) return false;
+    }
+    return true;
+  }
+
+  // ---------- HTML table parsing ----------
+  function extractHtmlTables(html) {
+    var out = [];
+    var re = /<table\b[^>]*>[\s\S]*?<\/table>/gi;
+    var m;
+    while ((m = re.exec(String(html || ''))) !== null) {
+      out.push(m[0]);
+    }
+    return out;
+  }
+
+  function parseHtmlTable(tableHtml) {
+    var rows = [];
+    var rowRe = /<tr\b[^>]*>[\s\S]*?<\/tr>/gi;
+    var rm;
+    while ((rm = rowRe.exec(String(tableHtml || ''))) !== null) {
+      var rowHtml = rm[0];
+      var cells = [];
+      var cellRe = /<(td|th)\b[^>]*>([\s\S]*?)<\/\1>/gi;
+      var cm;
+      while ((cm = cellRe.exec(rowHtml)) !== null) {
+        cells.push(cellHtmlToMarkdown(cm[2]));
+      }
+      if (cells.length) {
+        rows.push({
+          cells: cells,
+          isHeader: /<th\b/i.test(rowHtml)
+        });
+      }
+    }
+    return rows;
+  }
+
+  function detectColumnIndexes(headerCells) {
+    var lc = headerCells.map(function (c) { return String(c || '').toLowerCase(); });
+
+    function idxFor(keys) {
+      for (var i = 0; i < lc.length; i++) {
+        for (var k = 0; k < keys.length; k++) {
+          if (lc[i].indexOf(keys[k]) !== -1) return i;
+        }
+      }
+      return -1;
+    }
+
+    var nameIdx = idxFor(['ammunition', 'name', 'item', 'result']);
+    var weightIdx = idxFor(['weight', 'chance']);
+    var descIdx = idxFor(['description', 'desc', 'details', 'effect']);
+
+    // Defaults if not detected
+    if (nameIdx === -1) nameIdx = 0;
+    if (weightIdx === -1) weightIdx = 1;
+    if (descIdx === -1) descIdx = 2;
+
+    return { nameIdx: nameIdx, weightIdx: weightIdx, descIdx: descIdx };
+  }
+
+  // ---------- Pipe Markdown fallback ----------
+  function extractPipeTableBlocks(text) {
+    var lines = String(text || '').replace(/\r/g, '').split('\n');
+    var tables = [];
+    var cur = [];
+
+    function flush() {
+      if (cur.length >= 2) tables.push(cur.slice());
+      cur = [];
+    }
+
+    for (var i = 0; i < lines.length; i++) {
+      var t = trim(lines[i]);
+      var looksLike = (t.indexOf('|') !== -1) && (/^\|/.test(t) || /\|$/.test(t));
+      if (looksLike) cur.push(t);
+      else flush();
+    }
+    flush();
+    return tables;
+  }
+
+  function splitMarkdownRow(line) {
+    var placeholder = '<<PIPE>>';
+    var safe = String(line).replace(/\\\|/g, placeholder);
+    safe = safe.replace(/^\s*\|\s*/, '').replace(/\s*\|\s*$/, '');
+    var parts = safe.split('|').map(function (p) {
+      return trim(String(p).replace(new RegExp(placeholder, 'g'), '|'));
+    });
+    return parts;
+  }
+
+  function parsePipeTable(lines) {
+    var rows = [];
+    for (var i = 0; i < lines.length; i++) {
+      var cells = splitMarkdownRow(lines[i]);
+      if (!cells.length) continue;
+      if (isDividerRow(cells)) continue;
+      rows.push(cells);
+    }
+    if (!rows.length) return { header: [], rows: [] };
+
+    var header = rows[0];
+    var body = rows.slice(1);
+
+    // If header row does not look like a header, treat all rows as body
+    var headerLooks = header.some(function (c) {
+      var lc = trim(c).toLowerCase();
+      return lc === 'weight' || lc === 'ammunition' || lc === 'description' || lc === 'name';
+    });
+
+    return headerLooks ? { header: header, rows: body } : { header: [], rows: rows };
+  }
+
+  // ---------- Import ----------
+  function importRows(playerid, tableName, rows, col, opts) {
+    var mode = String(opts.mode || 'replace').toLowerCase();
+    if (mode !== 'replace' && mode !== 'append') mode = 'replace';
+
+    var showPlayersSpecified = (opts.showplayers !== undefined);
+    var showPlayers = toBool(opts.showplayers, false);
+    var nameOnly = toBool(opts.nameonly, false);
+
+    if (!rows.length) {
+      whisper(playerid, 'No rows found to import.');
+      return;
+    }
+
+    var table = findRollableTableByName(tableName);
+    var createdTable = false;
+
+    if (!table) {
+      table = createObj('rollabletable', { name: tableName, showplayers: showPlayers });
+      createdTable = true;
+    } else if (showPlayersSpecified) {
+      table.set('showplayers', showPlayers);
+    }
+
+    var removed = 0, created = 0, skipped = 0;
+
+    if (mode === 'replace') {
+      var existing = getTableItems(table.id);
+      for (var i = 0; i < existing.length; i++) {
+        existing[i].remove();
+        removed++;
+      }
+    }
+
+    for (var r = 0; r < rows.length; r++) {
+      var cells = rows[r];
+
+      var name = trim(cells[col.nameIdx] || '');
+      if (!name) { skipped++; continue; }
+
+      var weightRaw = trim(cells[col.weightIdx] || '');
+      var weight = parseInt(weightRaw, 10);
+      if (isNaN(weight) || weight <= 0) weight = 1;
+
+      var desc = trim(cells[col.descIdx] || '');
+      var itemName = (nameOnly || !desc) ? name : (name + ' - ' + desc);
+
+      createObj('tableitem', {
+        rollabletableid: table.id,
+        name: itemName,
+        weight: weight,
+        avatar: ''
+      });
+      created++;
+    }
+
+    whisper(
+      playerid,
+      '<b>Imported:</b> ' + tableName +
+      (createdTable ? ' (created table)' : '') +
+      '<br><b>Mode:</b> ' + mode +
+      '<br><b>Items:</b> created ' + created + ', removed ' + removed + ', skipped ' + skipped
+    );
+  }
+
+  function runImport(playerid, args) {
+    var handoutName = args.handout;
+    if (!handoutName) {
+      whisper(playerid, 'Missing required: --handout|Handout Name');
+      return;
+    }
+
+    var field = String(args.field || 'notes').toLowerCase();
+    if (field !== 'notes' && field !== 'gmnotes') field = 'notes';
+
+    var tableName = args.table || handoutName;
+    var index = parseInt(args.index || '1', 10);
+    if (isNaN(index) || index < 1) index = 1;
+
+    var h = findHandoutByName(handoutName);
+    if (!h) {
+      whisper(playerid, 'Handout not found: <b>' + handoutName + '</b>');
+      return;
+    }
+
+    h.get(field, function (html) {
+      var htmlStr = String(html || '');
+
+      // 1) Try HTML tables first
+      var htmlTables = extractHtmlTables(htmlStr);
+      if (htmlTables.length) {
+        if (index > htmlTables.length) {
+          whisper(playerid, 'Found ' + htmlTables.length + ' HTML table(s). You requested index ' + index + '.');
+          return;
+        }
+
+        var parsedRows = parseHtmlTable(htmlTables[index - 1]);
+
+        // Determine header row
+        var headerCells = null;
+        var bodyRows = [];
+        for (var i = 0; i < parsedRows.length; i++) {
+          var row = parsedRows[i];
+          if (!headerCells && row.isHeader) {
+            headerCells = row.cells;
+            continue;
+          }
+          if (isDividerRow(row.cells)) continue;
+          bodyRows.push(row.cells);
+        }
+
+        // If no <th> header, treat first row as header if it looks like one
+        if (!headerCells && parsedRows.length) {
+          var first = parsedRows[0].cells || [];
+          var looksHeader = first.some(function (c) {
+            var lc = String(c || '').toLowerCase();
+            return lc.indexOf('weight') !== -1 || lc.indexOf('description') !== -1 || lc.indexOf('ammunition') !== -1 || lc.indexOf('name') !== -1;
+          });
+          if (looksHeader) {
+            headerCells = first;
+            bodyRows = [];
+            for (var j = 1; j < parsedRows.length; j++) {
+              if (isDividerRow(parsedRows[j].cells)) continue;
+              bodyRows.push(parsedRows[j].cells);
+            }
+          }
+        }
+
+        var col = headerCells ? detectColumnIndexes(headerCells) : { nameIdx: 0, weightIdx: 1, descIdx: 2 };
+        importRows(playerid, tableName, bodyRows, col, args);
+        return;
+      }
+
+      // 2) Fallback: pipe-style Markdown tables (in case table stayed as text)
+      var text = decodeEntities(htmlStr.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]*>/g, '\n'));
+      var pipeTables = extractPipeTableBlocks(text);
+      if (!pipeTables.length) {
+        whisper(playerid, 'No HTML tables and no pipe-style Markdown tables found in handout ' + field + '.');
+        return;
+      }
+      if (index > pipeTables.length) {
+        whisper(playerid, 'Found ' + pipeTables.length + ' pipe table(s). You requested index ' + index + '.');
+        return;
+      }
+
+      var md = parsePipeTable(pipeTables[index - 1]);
+      var header = md.header || [];
+      var col2 = header.length ? detectColumnIndexes(header) : { nameIdx: 0, weightIdx: 1, descIdx: 2 };
+      importRows(playerid, tableName, md.rows || [], col2, args);
+    });
+  }
+
+  function showHelp(playerid) {
+    whisper(playerid,
+      '<b>' + SCRIPT + ' v' + VERSION + '</b>' +
+      '<br><br><b>Example</b>' +
+      '<br><code>' + COMMAND + ' --handout|Ammunition Import --table|Ammunition --mode|replace --showplayers|false</code>' +
+      '<br><br><b>Options</b>' +
+      '<br>--handout|Name (required)' +
+      '<br>--table|Name (optional)' +
+      '<br>--mode|replace|append' +
+      '<br>--showplayers|true|false' +
+      '<br>--field|notes|gmnotes (default notes)' +
+      '<br>--index|1' +
+      '<br>--nameonly|true|false'
+    );
+  }
+
+  function handleChat(msg) {
+    if (msg.type !== 'api') return;
+    if (String(msg.content || '').indexOf(COMMAND) !== 0) return;
+
+    if (!isGM(msg.playerid)) {
+      whisper(msg.playerid, 'GM only.');
+      return;
+    }
+
+    var args = parseArgs(msg.content);
+    if (args.help || args['?']) {
+      showHelp(msg.playerid);
+      return;
+    }
+
+    runImport(msg.playerid, args);
+  }
+
+  function register() {
+    on('chat:message', handleChat);
+    log(SCRIPT + ' v' + VERSION + ' ready.');
+  }
+
+  return { register: register };
+}());
+
+on('ready', function () {
+  MDTableImporter.register();
+});
