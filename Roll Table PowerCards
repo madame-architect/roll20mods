@@ -1,11 +1,27 @@
 /**
- * RollTableToPowerCard
- * Command: !rtcard --table|Ammunition [--whisper|gm]
+ * RollTableToPowerCard v1.2.0
+ * Command: !rtcard
  *
- * Rolls a weighted result from a Roll20 Rollable Table and prints a PowerCard with emoji by rarity.
- * Strips Markdown markers like ** from display.
+ * Rolls from a Roll20 Rollable Table and prints a PowerCard.
+ * Adds "Rolled By" row so it's always clear who triggered the roll.
  *
- * Requires: PowerCards (you already have it).
+ * Usage:
+ *   !rtcard --table|Ammunition
+ *   !rtcard --table|Roleplaying WarmUp --mode|simple --label|Prompt
+ *   !rtcard --table|Ammunition --whisper|gm
+ *
+ * Options:
+ *   --table|<name>              (required)
+ *   --title|<card title>        (optional; default table name)
+ *   --whisper|gm                (optional)
+ *   --mode|auto|simple          (default auto)
+ *   --label|Result              (single-row label in simple mode or auto fallback)
+ *   --namelabel|Item            (label for Name row when auto splits)
+ *   --effectlabel|Effect        (label for Effect row when auto splits)
+ *   --raritylabel|Rarity        (label for rarity row)
+ *   --icon|🎲                   (optional)
+ *   --showroller|true|false     (default true)
+ *   --rollerlabel|Rolled By     (default "Rolled By")
  */
 
 var RollTableToPowerCard = RollTableToPowerCard || (function () {
@@ -25,8 +41,15 @@ var RollTableToPowerCard = RollTableToPowerCard || (function () {
 
   function trim(s) { return String(s || '').replace(/^\s+|\s+$/g, ''); }
 
+  function toBool(val, def) {
+    if (val === undefined || val === null || val === '') return def;
+    var s = String(val).trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].indexOf(s) !== -1) return true;
+    if (['false', '0', 'no', 'off'].indexOf(s) !== -1) return false;
+    return def;
+  }
+
   function parseArgs(content) {
-    // !rtcard --key|value --flag
     var args = {};
     var parts = String(content || '').split(/\s+--/);
     for (var i = 1; i < parts.length; i++) {
@@ -49,17 +72,25 @@ var RollTableToPowerCard = RollTableToPowerCard || (function () {
   }
 
   function getTableItems(tableId) {
-    // Roll20 has been inconsistent across scripts; try both keys.
     var a = findObjs({ _type: 'tableitem', _rollabletableid: tableId }) || [];
     if (a.length) return a;
     return findObjs({ _type: 'tableitem', rollabletableid: tableId }) || [];
   }
 
+  function getRollerName(msg) {
+    var p = getObj('player', msg.playerid);
+    var n = p ? (p.get('_displayname') || p.get('displayname') || '') : '';
+    n = trim(n);
+    if (n) return n;
+
+    // Fallback: msg.who often includes "(GM)" which is still fine
+    return trim(msg.who || 'Unknown');
+  }
+
   function cleanText(s) {
     var out = String(s || '');
-    // Strip markdown markers and normalize some punctuation
     out = out.replace(/\*\*/g, '').replace(/\*/g, '').replace(/`/g, '');
-    out = out.replace(/[\u2013\u2014]/g, '-'); // en dash/em dash -> hyphen
+    out = out.replace(/[\u2013\u2014]/g, '-'); // en dash/em dash to hyphen
     out = out.replace(/\s+/g, ' ');
     return trim(out);
   }
@@ -84,9 +115,8 @@ var RollTableToPowerCard = RollTableToPowerCard || (function () {
     return items[items.length - 1];
   }
 
-  function extractRarity(name, desc) {
-    var combined = (name + ' ' + desc).toLowerCase();
-
+  function extractRarity(text) {
+    var combined = String(text || '').toLowerCase();
     for (var i = 0; i < RARITY_ORDER.length; i++) {
       var r = RARITY_ORDER[i];
       if (combined.indexOf(r.toLowerCase()) !== -1) return r;
@@ -94,22 +124,20 @@ var RollTableToPowerCard = RollTableToPowerCard || (function () {
     return '';
   }
 
-  function splitNameDesc(raw) {
-    // Common patterns you might have:
-    // "Name - Uncommon. Effect..."
-    // "Name (Uncommon): Effect..."
-    // "Name - Effect..." (rarity embedded in effect)
+  function splitNameEffect(raw) {
     var s = cleanText(raw);
 
+    // "Name (Rare): Effect..."
     var m1 = s.match(/^(.*?)\s*\((Common|Uncommon|Rare|Very Rare|Legendary)\)\s*:\s*(.*)$/i);
     if (m1) return { name: trim(m1[1]), rarity: m1[2], effect: trim(m1[3]) };
 
+    // "Name - Effect..."
     var parts = s.split(' - ');
     if (parts.length >= 2) {
       var n = trim(parts.shift());
       var rest = trim(parts.join(' - '));
 
-      // If rest starts with "Uncommon." etc, peel it off
+      // "Uncommon. Effect..."
       var m2 = rest.match(/^(Common|Uncommon|Rare|Very Rare|Legendary)\.?\s*(.*)$/i);
       if (m2) return { name: n, rarity: m2[1], effect: trim(m2[2]) };
 
@@ -119,28 +147,33 @@ var RollTableToPowerCard = RollTableToPowerCard || (function () {
     return { name: s, rarity: '', effect: '' };
   }
 
-  function escForPowerCards(s) {
-    // PowerCards uses | as delimiter; escape it
+  function escVal(s) {
     return String(s || '').replace(/\|/g, '&#124;');
   }
 
-  function buildPowerCard(payload) {
-    var title = payload.title || 'Ammunition';
+  function buildPowerCard(opts) {
     var pc = '!power';
 
-    if (payload.whisper) pc += ' --whisper|' + payload.whisper;
+    if (opts.whisper) pc += ' --whisper|' + opts.whisper;
 
-    pc += ' --name|' + escForPowerCards('🏹 ' + title);
+    pc += ' --name|' + escVal((opts.icon || '🎲') + ' ' + (opts.title || 'Roll Table'));
 
-    if (payload.rarity) {
-      var e = RARITY_EMOJI[payload.rarity] || '🎲';
-      pc += ' --Rarity|' + escForPowerCards(e + ' ' + payload.rarity);
+    if (opts.showRoller) {
+      pc += ' --' + escVal(opts.rollerLabel || 'Rolled By') + '|' + escVal(opts.roller || 'Unknown');
     }
 
-    pc += ' --Ammo|' + escForPowerCards(payload.name || 'Unknown');
+    if (opts.rarity) {
+      var e = RARITY_EMOJI[opts.rarity] || '🎲';
+      pc += ' --' + escVal(opts.rarityLabel || 'Rarity') + '|' + escVal(e + ' ' + opts.rarity);
+    }
 
-    if (payload.effect) pc += ' --Effect|' + escForPowerCards(payload.effect);
+    if (opts.mode === 'simple' || !opts.effect) {
+      pc += ' --' + escVal(opts.label || 'Result') + '|' + escVal(opts.result || opts.name || 'Unknown');
+      return pc;
+    }
 
+    pc += ' --' + escVal(opts.nameLabel || 'Item') + '|' + escVal(opts.name || 'Unknown');
+    pc += ' --' + escVal(opts.effectLabel || 'Effect') + '|' + escVal(opts.effect);
     return pc;
   }
 
@@ -149,9 +182,29 @@ var RollTableToPowerCard = RollTableToPowerCard || (function () {
     if (String(msg.content || '').indexOf(COMMAND) !== 0) return;
 
     var args = parseArgs(msg.content);
-    var tableName = args.table || args.t || 'Ammunition';
-    var whisper = args.whisper || args.w || ''; // use "gm" to whisper to GM
+
+    var tableName = args.table || args.t;
+    if (!tableName) {
+      sendChat(SCRIPT, '/w gm ' + SCRIPT + ': Missing --table|Table Name');
+      return;
+    }
+
     var title = args.title || tableName;
+    var whisper = args.whisper || args.w || '';
+    var mode = String(args.mode || 'auto').toLowerCase();
+    if (mode !== 'auto' && mode !== 'simple') mode = 'auto';
+
+    var isAmmoTable = /ammo|ammunition/i.test(tableName);
+    var icon = args.icon || (isAmmoTable ? '🏹' : '🎲');
+
+    var label = args.label || 'Result';
+    var nameLabel = args.namelabel || (isAmmoTable ? 'Ammo' : 'Item');
+    var effectLabel = args.effectlabel || 'Effect';
+    var rarityLabel = args.raritylabel || 'Rarity';
+
+    var showRoller = toBool(args.showroller, true);
+    var rollerLabel = args.rollerlabel || 'Rolled By';
+    var roller = getRollerName(msg);
 
     var table = findRollableTableByName(tableName);
     if (!table) {
@@ -172,24 +225,36 @@ var RollTableToPowerCard = RollTableToPowerCard || (function () {
     }
 
     var raw = String(pick.get('name') || '');
-    var parsed = splitNameDesc(raw);
-    var rarity = parsed.rarity || extractRarity(parsed.name, parsed.effect);
+    var parsed = splitNameEffect(raw);
+    var rarity = parsed.rarity || extractRarity(raw);
 
     var pc = buildPowerCard({
       title: title,
       whisper: whisper,
-      name: parsed.name,
+      mode: mode,
+      icon: icon,
+
+      label: label,
+      nameLabel: nameLabel,
+      effectLabel: effectLabel,
+      rarityLabel: rarityLabel,
+
+      showRoller: showRoller,
+      rollerLabel: rollerLabel,
+      roller: roller,
+
       rarity: rarity,
+      result: cleanText(raw),
+      name: parsed.name,
       effect: parsed.effect
     });
 
-    // Let PowerCards render it
     sendChat(SCRIPT, pc);
   }
 
   function register() {
     on('chat:message', handleChat);
-    log(SCRIPT + ' ready. Use: ' + COMMAND + ' --table|Ammunition');
+    log(SCRIPT + ' ready. Use: ' + COMMAND + ' --table|YourTable');
   }
 
   return { register: register };
